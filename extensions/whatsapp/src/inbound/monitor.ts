@@ -1,5 +1,12 @@
 import type { AnyMessageContent, proto, WAMessage } from "@whiskeysockets/baileys";
-import { DisconnectReason, isJidGroup } from "@whiskeysockets/baileys";
+import {
+  DisconnectReason,
+  decryptPollVote,
+  getAggregateVotesInPollMessage,
+  isJidGroup,
+  jidNormalizedUser,
+  normalizeMessageContent,
+} from "@whiskeysockets/baileys";
 import { createInboundDebouncer } from "../../../../src/auto-reply/inbound-debounce.js";
 import { formatLocationText } from "../../../../src/channels/location.js";
 import { logVerbose, shouldLogVerbose } from "../../../../src/globals.js";
@@ -19,6 +26,7 @@ import {
   extractText,
 } from "./extract.js";
 import { downloadInboundMedia } from "./media.js";
+import { isPollCreationMessage, PollStore } from "./poll-store.js";
 import { createWebSendApi } from "./send-api.js";
 import type { WebInboundMessage, WebListenerCloseReason } from "./types.js";
 
@@ -119,6 +127,8 @@ export async function monitorWebInbox(options: {
   >();
   const GROUP_META_TTL_MS = 5 * 60 * 1000; // 5 minutes
   const lidLookup = sock.signalRepository?.lidMapping;
+  const pollStorePath = `${options.authDir}/poll-store.json`;
+  const pollStore = new PollStore(pollStorePath);
 
   const resolveInboundJid = async (jid: string | null | undefined): Promise<string | null> =>
     resolveJidToE164(jid, { authDir: options.authDir, lidLookup });
@@ -401,6 +411,10 @@ export async function monitorWebInbox(options: {
       return;
     }
     for (const msg of upsert.messages ?? []) {
+      // Track poll creation messages for later vote decryption.
+      if (msg.key?.id && isPollCreationMessage(msg.message ?? undefined)) {
+        pollStore.trackPoll(msg.key.id, msg);
+      }
       recordChannelActivity({
         channel: "whatsapp",
         accountId: options.accountId,
@@ -429,6 +443,177 @@ export async function monitorWebInbox(options: {
         continue;
       }
 
+      // If this is a poll vote (pollUpdateMessage), try to enrich the body with
+      // actual vote selections by decrypting via the PollStore.
+      // Use normalizeMessageContent to unwrap ephemeral/viewOnce wrappers.
+      const normalizedMsg = normalizeMessageContent(msg.message ?? undefined);
+      const pollUpdateMsg = normalizedMsg?.pollUpdateMessage;
+      if (pollUpdateMsg && enriched.body === "<media:poll-vote>") {
+        const pollCreationKey = pollUpdateMsg.pollCreationMessageKey;
+        const pollMsgId = pollCreationKey?.id;
+        inboundLogger.info(
+          {
+            pollMsgId,
+            hasPollCreationKey: Boolean(pollCreationKey),
+            hasVote: Boolean(pollUpdateMsg.vote),
+            msgKeys: Object.keys(normalizedMsg ?? {}),
+            storedPollExists: pollMsgId ? Boolean(pollStore.getPoll(pollMsgId)) : false,
+          },
+          "poll vote upsert: attempting decryption",
+        );
+        if (pollMsgId) {
+          const storedPoll = pollStore.getPoll(pollMsgId);
+          if (storedPoll?.message) {
+            try {
+              // The vote in messages.upsert is encrypted (IPollEncValue).
+              // Use decryptPollVote to decrypt it, then match SHA-256 hashes
+              // of option names to determine the selected options.
+              const storedMessage = storedPoll.message.message;
+              const pollEncKey = (storedMessage as Record<string, unknown>)?.messageContextInfo as
+                | { messageSecret?: Uint8Array }
+                | undefined;
+              // After JSON round-trip (PollStore disk persistence), messageSecret
+              // is a base64 string instead of Uint8Array. Convert it back.
+              const rawSecret = pollEncKey?.messageSecret;
+              const messageSecret: Uint8Array | undefined =
+                typeof rawSecret === "string"
+                  ? Buffer.from(rawSecret, "base64")
+                  : rawSecret instanceof Uint8Array
+                    ? rawSecret
+                    : rawSecret
+                      ? Buffer.from(Object.values(rawSecret as Record<string, number>))
+                      : undefined;
+
+              const voterJid = msg.key?.participant || msg.key?.remoteJid;
+              const voterE164 = voterJid ? await resolveInboundJid(voterJid) : null;
+              const voterLabel = voterE164 ?? voterJid ?? "unknown";
+
+              // Extract poll question and options.
+              const creation = (storedMessage?.pollCreationMessage ??
+                (storedMessage as Record<string, unknown> | undefined)?.pollCreationMessageV2 ??
+                (storedMessage as Record<string, unknown> | undefined)?.pollCreationMessageV3) as
+                | { name?: string; options?: Array<{ optionName?: string }> }
+                | undefined;
+              const pollQuestion = (creation?.name ?? "Poll").trim() || "Poll";
+              const options = creation?.options ?? [];
+
+              if (messageSecret && pollUpdateMsg.vote) {
+                // Use Baileys' getKeyAuthor logic:
+                // pollCreatorJid = fromMe ? meId : (participant || remoteJid)
+                // voterJid = fromMe ? meId : (participant || remoteJid) for the vote msg
+                // Note: WhatsApp LID privacy may require using selfLid instead of selfJid.
+                // Try both — first with LID, fallback to JID.
+                const meJid = jidNormalizedUser(selfJid ?? "");
+                const meLid = selfLid ? jidNormalizedUser(selfLid) : null;
+
+                const getCreatorJid = (meId: string) =>
+                  storedPoll.message.key?.fromMe
+                    ? meId
+                    : jidNormalizedUser(
+                        storedPoll.message.key?.participant ||
+                          storedPoll.message.key?.remoteJid ||
+                          "",
+                      );
+                const getVoterJid = (meId: string) =>
+                  msg.key?.fromMe
+                    ? meId
+                    : jidNormalizedUser(msg.key?.participant || msg.key?.remoteJid || "");
+
+                // Try LID first (newer WhatsApp privacy), then JID.
+                const attempts = meLid ? [meLid, meJid] : [meJid];
+                let decryptedVote: { selectedOptions?: Uint8Array[] } | null = null;
+                let usedCreatorJid = "";
+                let usedVoterJid = "";
+
+                for (const meId of attempts) {
+                  usedCreatorJid = getCreatorJid(meId);
+                  usedVoterJid = getVoterJid(meId);
+                  try {
+                    decryptedVote = decryptPollVote(pollUpdateMsg.vote, {
+                      pollEncKey: messageSecret as Buffer,
+                      pollCreatorJid: usedCreatorJid,
+                      pollMsgId,
+                      voterJid: usedVoterJid,
+                    });
+                    break; // Success — stop trying.
+                  } catch {
+                    // Try next identity format.
+                    decryptedVote = null;
+                  }
+                }
+
+                if (decryptedVote) {
+                  // decryptedVote.selectedOptions are SHA-256 hashes (Uint8Array[]).
+                  // Match them against SHA-256 hashes of option names.
+                  const { createHash } = await import("node:crypto");
+                  const selectedOptionHashes = new Set(
+                    (decryptedVote.selectedOptions ?? []).map((opt) =>
+                      Buffer.from(opt).toString("hex"),
+                    ),
+                  );
+
+                  const selected: string[] = [];
+                  for (const opt of options) {
+                    const optName = opt.optionName ?? "";
+                    const hash = createHash("sha256").update(Buffer.from(optName)).digest("hex");
+                    if (selectedOptionHashes.has(hash)) {
+                      selected.push(optName);
+                    }
+                  }
+
+                  inboundLogger.info(
+                    {
+                      selected,
+                      voterLabel,
+                      pollQuestion,
+                      optionCount: options.length,
+                      usedCreatorJid,
+                      usedVoterJid,
+                    },
+                    "poll vote decrypted successfully",
+                  );
+
+                  if (selected.length > 0) {
+                    const selectedStr = selected.join(", ");
+                    enriched.body = `<media:poll-vote voter="${voterLabel}" selected="${selectedStr}" poll="${pollQuestion}">`;
+                  } else {
+                    enriched.body = `<media:poll-vote voter="${voterLabel}" poll="${pollQuestion}">`;
+                  }
+                } else {
+                  inboundLogger.info(
+                    {
+                      meJid,
+                      meLid,
+                      pollMsgId,
+                      pollCreatorFromMe: storedPoll.message.key?.fromMe,
+                      voterFromMe: msg.key?.fromMe,
+                      voterRemoteJid: msg.key?.remoteJid,
+                      voterParticipant: msg.key?.participant,
+                    },
+                    "poll vote decryption FAILED with all identity variants",
+                  );
+                  enriched.body = `<media:poll-vote voter="${voterLabel}" poll="${pollQuestion}">`;
+                }
+              } else {
+                enriched.body = `<media:poll-vote voter="${voterLabel}" poll="${pollQuestion}">`;
+                inboundLogger.info(
+                  {
+                    hasMessageSecret: Boolean(messageSecret),
+                    hasVote: Boolean(pollUpdateMsg.vote),
+                  },
+                  "poll vote: missing encryption data for decryption",
+                );
+              }
+            } catch (err) {
+              inboundLogger.info(
+                { error: String(err), pollMsgId },
+                "poll vote decryption FAILED (outer)",
+              );
+            }
+          }
+        }
+      }
+
       await enqueueInboundMessage(msg, inbound, enriched);
     }
   };
@@ -436,36 +621,117 @@ export async function monitorWebInbox(options: {
 
   // Poll vote updates arrive via messages.update with pollUpdates array.
   // These are separate from messages.upsert and must be subscribed to explicitly.
-  // We construct a synthetic WAMessage so the vote flows through the full pipeline.
+  // We decrypt votes using getAggregateVotesInPollMessage (requires the original
+  // poll creation message from PollStore), deduplicate cumulative vote events,
+  // and construct synthetic WAMessages so votes flow through the full pipeline.
   const handleMessagesUpdate = async (
     updates: Array<{ key: proto.IMessageKey; update: Partial<WAMessage> }>,
   ) => {
+    inboundLogger.info(
+      { updateCount: updates.length, keys: updates.map((u) => u.key?.id).slice(0, 5) },
+      "messages.update event received",
+    );
     for (const { key, update } of updates) {
+      const hasPollUpdates = Boolean(update.pollUpdates && update.pollUpdates.length > 0);
+      if (hasPollUpdates) {
+        inboundLogger.info(
+          { messageId: key.id, chatId: key.remoteJid, pollUpdateCount: update.pollUpdates?.length },
+          "poll vote update found in messages.update",
+        );
+      }
       if (!update.pollUpdates || update.pollUpdates.length === 0) {
         continue;
       }
       const chatJid = key.remoteJid;
-      if (!chatJid) {
+      const pollMessageId = key.id;
+      if (!chatJid || !pollMessageId) {
         continue;
       }
+
+      // Look up the original poll creation message for vote decryption.
+      const storedPoll = pollStore.getPoll(pollMessageId);
+      let voteAggregation: Array<{ name: string; voters: string[] }> = [];
+      let pollQuestion = "Poll";
+
+      if (storedPoll?.message) {
+        try {
+          voteAggregation = getAggregateVotesInPollMessage(
+            {
+              message: storedPoll.message.message ?? undefined,
+              pollUpdates: update.pollUpdates,
+            } as Pick<WAMessage, "pollUpdates" | "message">,
+            selfJid ?? undefined,
+          );
+          // Extract the poll question for context.
+          const creation =
+            storedPoll.message.message?.pollCreationMessage ??
+            (storedPoll.message.message as Record<string, unknown> | undefined)
+              ?.pollCreationMessageV2 ??
+            (storedPoll.message.message as Record<string, unknown> | undefined)
+              ?.pollCreationMessageV3;
+          if (creation && typeof creation === "object" && "name" in creation) {
+            pollQuestion = ((creation as { name?: string }).name ?? "Poll").trim() || "Poll";
+          }
+        } catch (err) {
+          logVerbose(`Failed to decrypt poll votes for ${pollMessageId}: ${String(err)}`);
+        }
+      } else {
+        logVerbose(
+          `Poll creation message not found in store for ${pollMessageId}; vote data unavailable`,
+        );
+      }
+
       inboundLogger.info(
         {
           chatId: chatJid,
-          messageId: key.id,
+          messageId: pollMessageId,
           voteCount: update.pollUpdates.length,
+          aggregation: voteAggregation,
         },
         "poll vote update received",
       );
-      // Each pollUpdate entry has a pollUpdateMessageKey with the voter's identity.
-      // Process each voter's update individually so access control checks the voter,
-      // not the poll creator (key.participant is the poll creator, not the voter).
+
+      // Build a map of voter → selected options from the aggregation.
+      const voterSelections = new Map<string, string[]>();
+      for (const option of voteAggregation) {
+        for (const voter of option.voters) {
+          const existing = voterSelections.get(voter) ?? [];
+          existing.push(option.name);
+          voterSelections.set(voter, existing);
+        }
+      }
+
+      // Process each pollUpdate entry individually for access control.
+      // Deduplicate so cumulative Baileys events don't re-notify the same voter.
       for (const pollUpdate of update.pollUpdates) {
         const voterKey = pollUpdate.pollUpdateMessageKey;
         const voterParticipant = voterKey?.participant ?? key.participant;
+        if (!voterParticipant) {
+          continue;
+        }
+
+        // Skip if this voter was already reported for this poll.
+        if (pollStore.isVoteReported(pollMessageId, voterParticipant)) {
+          continue;
+        }
+        pollStore.markVoteReported(pollMessageId, voterParticipant);
+
+        // Build the vote body with actual selection data.
+        const selections = voterSelections.get(voterParticipant);
+        const voterE164 = await resolveInboundJid(voterParticipant);
+        const voterLabel = voterE164 ?? voterParticipant;
+        let voteBody: string;
+        if (selections && selections.length > 0) {
+          const selectedStr = selections.join(", ");
+          voteBody = `<media:poll-vote voter="${voterLabel}" selected="${selectedStr}" poll="${pollQuestion}">`;
+        } else {
+          voteBody = `<media:poll-vote voter="${voterLabel}" poll="${pollQuestion}">`;
+        }
+
         const syntheticMsg: WAMessage = {
           key: {
             remoteJid: chatJid,
-            id: `poll-vote-${key.id}-${voterParticipant}-${Date.now()}`,
+            id: `poll-vote-${pollMessageId}-${voterParticipant}-${Date.now()}`,
             participant: voterParticipant,
             fromMe: Boolean(voterKey?.fromMe),
           },
@@ -481,10 +747,13 @@ export async function monitorWebInbox(options: {
         if (!inbound) {
           continue;
         }
+        // Override the enriched body with our decoded vote data instead of
+        // relying on extractMediaPlaceholder (which only returns "<media:poll-vote>").
         const enriched = await enrichInboundMessage(syntheticMsg);
         if (!enriched) {
           continue;
         }
+        enriched.body = voteBody;
         await enqueueInboundMessage(syntheticMsg, inbound, enriched);
       }
     }
@@ -616,6 +885,39 @@ export async function monitorWebInbox(options: {
       resolveClose(reason ?? { status: undefined, isLoggedOut: false, error: "closed" });
     },
     // IPC surface (sendMessage/sendPoll/sendReaction/sendComposingTo)
+    // Wrap sendPoll to track outbound polls in the PollStore for vote decryption.
     ...sendApi,
+    sendPoll: async (
+      to: string,
+      poll: { question: string; options: string[]; maxSelections?: number },
+    ) => {
+      const result = await sendApi.sendPoll(to, poll);
+      // Store the ACTUAL WAMessage returned by Baileys (contains messageSecret
+      // needed for poll vote decryption) rather than a synthetic one.
+      if (result.messageId && result.messageId !== "unknown") {
+        inboundLogger.info(
+          { messageId: result.messageId, question: poll.question },
+          "tracking outbound poll in PollStore",
+        );
+        const rawMsg = result.rawResult as WAMessage | undefined;
+        if (rawMsg?.message) {
+          pollStore.trackPoll(result.messageId, rawMsg);
+        } else {
+          // Fallback: synthetic message (won't decrypt but preserves poll name).
+          const syntheticCreation: WAMessage = {
+            key: { remoteJid: to, id: result.messageId, fromMe: true },
+            message: {
+              pollCreationMessage: {
+                name: poll.question,
+                options: poll.options.map((name) => ({ optionName: name })),
+                selectableOptionsCount: poll.maxSelections ?? 1,
+              },
+            } as proto.IMessage,
+          };
+          pollStore.trackPoll(result.messageId, syntheticCreation);
+        }
+      }
+      return result;
+    },
   } as const;
 }
