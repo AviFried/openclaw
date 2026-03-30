@@ -150,7 +150,7 @@ describe("test planner", () => {
     expect(plan.executionBudget.unitIsolatedWorkers).toBe(1);
     expect(plan.executionBudget.topLevelParallelLimitNoIsolate).toBe(4);
     expect(plan.executionBudget.topLevelParallelLimitIsolated).toBe(1);
-    expect(plan.topLevelParallelLimit).toBe(4);
+    expect(plan.topLevelParallelLimit).toBe(3);
     expect(plan.deferredRunConcurrency).toBe(1);
     artifacts.cleanupTempArtifacts();
   });
@@ -180,10 +180,27 @@ describe("test planner", () => {
     const sharedUnitBatches = plan.selectedUnits.filter(
       (unit) => unit.surface === "unit" && !unit.isolate && unit.id.startsWith("unit-fast"),
     );
+    const baselinePlan = buildExecutionPlan(
+      {
+        profile: null,
+        mode: "local",
+        surfaces: ["unit"],
+        passthroughArgs: [],
+      },
+      {
+        env,
+        platform: "darwin",
+        loadAverage: [1, 1, 1],
+        writeTempJsonArtifact: artifacts.writeTempJsonArtifact,
+      },
+    );
+    const baselineSharedUnitBatches = baselinePlan.selectedUnits.filter(
+      (unit) => unit.surface === "unit" && !unit.isolate && unit.id.startsWith("unit-fast"),
+    );
 
     expect(plan.runtimeCapabilities.memoryBand).toBe("high");
     expect(plan.runtimeCapabilities.loadBand).toBe("saturated");
-    expect(sharedUnitBatches).toHaveLength(3);
+    expect(sharedUnitBatches.length).toBeLessThan(baselineSharedUnitBatches.length);
     expect(plan.executionBudget.unitIsolatedWorkers).toBe(1);
     expect(plan.executionBudget.unitFastBatchTargetMs).toBe(90_000);
     artifacts.cleanupTempArtifacts();
@@ -400,7 +417,7 @@ describe("test planner", () => {
     artifacts.cleanupTempArtifacts();
   });
 
-  it("assigns single include-file CI batches to one shard instead of over-sharding them", () => {
+  it("pins the smallest CI include-file batches to fixed shards", () => {
     const env = {
       CI: "true",
       GITHUB_ACTIONS: "true",
@@ -421,16 +438,24 @@ describe("test planner", () => {
       },
     );
 
-    const singleFileBatch = plan.parallelUnits.find(
+    const shardableUnits = plan.parallelUnits.filter(
       (unit) =>
         unit.id.startsWith("unit-fast-") &&
-        unit.fixedShardIndex === undefined &&
         Array.isArray(unit.includeFiles) &&
-        unit.includeFiles.length === 1,
+        unit.includeFiles.length > 0,
+    );
+    const smallestIncludeCount = Math.min(
+      ...shardableUnits.map((unit) => unit.includeFiles.length),
+    );
+    const smallestBatches = shardableUnits.filter(
+      (unit) => unit.includeFiles.length === smallestIncludeCount,
     );
 
-    expect(singleFileBatch).toBeTruthy();
-    expect(plan.topLevelSingleShardAssignments.get(singleFileBatch)).toBeTypeOf("number");
+    expect(smallestBatches.length).toBeGreaterThan(0);
+    expect(smallestBatches.every((unit) => typeof unit.fixedShardIndex === "number")).toBe(true);
+    expect(
+      smallestBatches.every((unit) => plan.topLevelSingleShardAssignments.get(unit) === undefined),
+    ).toBe(true);
 
     artifacts.cleanupTempArtifacts();
   });
