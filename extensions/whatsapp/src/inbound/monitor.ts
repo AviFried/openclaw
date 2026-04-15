@@ -632,7 +632,11 @@ export async function attachWebInboxToSocket(
                 (pollCreationMsg as Record<string, unknown> | undefined)?.pollCreationMessageV3;
               const options_list =
                 (pollCreation as { options?: Array<{ optionName?: string }> })?.options ?? [];
-              let messageSecret = (pollCreation as { messageSecret?: unknown })?.messageSecret;
+              // messageSecret may be in messageContextInfo (outbound polls) or pollCreation itself.
+              let messageSecret =
+                (pollCreationMsg?.messageContextInfo as { messageSecret?: unknown } | undefined)
+                  ?.messageSecret ??
+                (pollCreation as { messageSecret?: unknown })?.messageSecret;
               // After disk round-trip, Uint8Array is serialized as base64 string — convert back.
               if (typeof messageSecret === "string") {
                 messageSecret = Buffer.from(messageSecret, "base64");
@@ -740,7 +744,11 @@ export async function attachWebInboxToSocket(
         (pollCreationMsg as Record<string, unknown> | undefined)?.pollCreationMessageV3;
       const options_list =
         (pollCreation as { options?: Array<{ optionName?: string }> })?.options ?? [];
-      let messageSecret = (pollCreation as { messageSecret?: unknown })?.messageSecret;
+      // messageSecret may be in messageContextInfo (outbound polls) or pollCreation itself.
+      let messageSecret =
+        (pollCreationMsg?.messageContextInfo as { messageSecret?: unknown } | undefined)
+          ?.messageSecret ??
+        (pollCreation as { messageSecret?: unknown })?.messageSecret;
       if (typeof messageSecret === "string") {
         messageSecret = Buffer.from(messageSecret, "base64");
       }
