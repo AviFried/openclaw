@@ -119,7 +119,7 @@ export function buildWhatsAppInboundContext(params: {
     MediaUrl: params.msg.mediaUrl,
     MediaType: params.msg.mediaType,
     ChatType: params.msg.chatType,
-    Timestamp: params.msg.timestamp,
+    Timestamp: Date.now(),
     ConversationLabel: params.msg.chatType === "group" ? params.conversationId : params.msg.from,
     GroupSubject: params.msg.groupSubject,
     GroupMembers: formatGroupMembers({
