@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import type { AnyMessageContent, proto, WAMessage, WASocket } from "@whiskeysockets/baileys";
+import { decryptPollVote, normalizeMessageContent } from "@whiskeysockets/baileys";
 import { createInboundDebouncer, formatLocationText } from "openclaw/plugin-sdk/channel-inbound";
 import { recordChannelActivity } from "openclaw/plugin-sdk/infra-runtime";
 import { logVerbose, shouldLogVerbose } from "openclaw/plugin-sdk/runtime-env";
@@ -27,6 +29,7 @@ import {
 } from "./extract.js";
 import { attachEmitterListener, closeInboundMonitorSocket } from "./lifecycle.js";
 import { downloadInboundMedia } from "./media.js";
+import { isPollCreationMessage, PollStore } from "./poll-store.js";
 import { DisconnectReason, isJidGroup, saveMediaBuffer } from "./runtime-api.js";
 import { createWebSendApi } from "./send-api.js";
 import type { WebInboundMessage, WebListenerCloseReason } from "./types.js";
@@ -127,6 +130,11 @@ export async function attachWebInboxToSocket(
     options.authDir,
     sock.user as { id?: string | null; lid?: string | null } | undefined,
   );
+
+  // Poll store for tracking poll creation messages (encryption keys needed for vote decryption).
+  const pollStorePath = `${options.authDir}/poll-store.json`;
+  const pollStore = new PollStore(pollStorePath);
+
   type QueuedInboundMessage = WebInboundMessage & {
     dedupeKey?: string;
   };
@@ -576,6 +584,12 @@ export async function attachWebInboxToSocket(
         accountId: options.accountId,
         direction: "inbound",
       });
+
+      // Track inbound poll creation messages for later vote decryption.
+      if (msg.key?.id && isPollCreationMessage(normalizeMessageContent(msg.message ?? undefined))) {
+        pollStore.trackPoll(msg.key.id, msg);
+      }
+
       const inbound = await normalizeInboundMessage(msg);
       if (!inbound) {
         continue;
@@ -599,6 +613,90 @@ export async function attachWebInboxToSocket(
         continue;
       }
 
+      // Enrich poll vote messages with decrypted vote selections.
+      const normalizedMsg = normalizeMessageContent(msg.message ?? undefined);
+      const pollUpdateMsg = normalizedMsg?.pollUpdateMessage;
+      if (pollUpdateMsg && enriched.body === "<media:poll-vote>") {
+        const pollCreationKey = pollUpdateMsg.pollCreationMessageKey;
+        const pollMsgId = pollCreationKey?.id;
+        if (pollMsgId) {
+          const storedPoll = pollStore.getPoll(pollMsgId);
+          if (storedPoll?.message) {
+            try {
+              const pollCreationMsg = normalizeMessageContent(
+                storedPoll.message.message ?? undefined,
+              );
+              const pollCreation =
+                pollCreationMsg?.pollCreationMessage ??
+                (pollCreationMsg as Record<string, unknown> | undefined)?.pollCreationMessageV2 ??
+                (pollCreationMsg as Record<string, unknown> | undefined)?.pollCreationMessageV3;
+              const options_list =
+                (pollCreation as { options?: Array<{ optionName?: string }> })?.options ?? [];
+              let messageSecret = (pollCreation as { messageSecret?: unknown })?.messageSecret;
+              // After disk round-trip, Uint8Array is serialized as base64 string — convert back.
+              if (typeof messageSecret === "string") {
+                messageSecret = Buffer.from(messageSecret, "base64");
+              }
+              if (messageSecret) {
+                const voterJid = msg.key?.participant || msg.key?.remoteJid || "";
+                const voterLabel = (await resolveInboundJid(voterJid)) || voterJid;
+                const pollQuestion = (pollCreation as { name?: string })?.name ?? "";
+                const pollCreatedAt = new Date(storedPoll.createdAt).toISOString();
+
+                // Try decrypting with LID first (newer WhatsApp privacy), then JID.
+                let decrypted: ReturnType<typeof decryptPollVote> | null = null;
+                for (const creatorId of [self.lid, self.jid].filter(Boolean)) {
+                  try {
+                    decrypted = decryptPollVote(pollUpdateMsg.vote as proto.Message.IPollEncValue, {
+                      pollEncKey: messageSecret as Uint8Array,
+                      pollCreatorJid: creatorId!,
+                      pollMsgId,
+                      voterJid,
+                    });
+                    if (decrypted?.selectedOptions?.length) {
+                      break;
+                    }
+                  } catch {
+                    // Try next identity variant.
+                  }
+                }
+
+                if (decrypted?.selectedOptions?.length) {
+                  // Match SHA-256 hashes to option names.
+                  const selected: string[] = [];
+                  for (const optionHash of decrypted.selectedOptions) {
+                    const voteHash = Buffer.isBuffer(optionHash)
+                      ? optionHash.toString("hex")
+                      : Buffer.from(optionHash).toString("hex");
+                    for (const opt of options_list) {
+                      const optName = opt.optionName ?? "";
+                      const optHash = createHash("sha256").update(optName).digest("hex");
+                      if (optHash === voteHash) {
+                        selected.push(optName);
+                        break;
+                      }
+                    }
+                  }
+                  if (selected.length > 0) {
+                    const selectedStr = selected.join(", ");
+                    enriched.body = `<media:poll-vote voter="${voterLabel}" selected="${selectedStr}" poll="${pollQuestion}" poll_id="${pollMsgId}" poll_created_at="${pollCreatedAt}">`;
+                  } else {
+                    enriched.body = `<media:poll-vote voter="${voterLabel}" poll="${pollQuestion}" poll_id="${pollMsgId}" poll_created_at="${pollCreatedAt}">`;
+                  }
+                } else {
+                  enriched.body = `<media:poll-vote voter="${voterLabel}" poll="${pollQuestion}" poll_id="${pollMsgId}" poll_created_at="${pollCreatedAt}">`;
+                }
+              }
+            } catch (err) {
+              inboundLogger.info(
+                { error: String(err), pollMsgId },
+                "poll vote decryption failed in upsert",
+              );
+            }
+          }
+        }
+      }
+
       const dedupeKey = inbound.id ? `${options.accountId}:${inbound.remoteJid}:${inbound.id}` : "";
       if (dedupeKey && !(await claimRecentInboundMessage(dedupeKey))) {
         continue;
@@ -607,6 +705,180 @@ export async function attachWebInboxToSocket(
       await enqueueInboundMessage(msg, inbound, enriched);
     }
   };
+  // Handle poll votes arriving via the messages.update event (cumulative pollUpdates array).
+  const handleMessagesUpdate = async (
+    updates: Array<{ update: { pollUpdates?: unknown[] }; key: proto.IMessageKey }>,
+  ) => {
+    for (const { update, key } of updates) {
+      if (
+        !update.pollUpdates ||
+        !Array.isArray(update.pollUpdates) ||
+        update.pollUpdates.length === 0
+      ) {
+        continue;
+      }
+      recordChannelActivity({
+        channel: "whatsapp",
+        accountId: options.accountId,
+        direction: "inbound",
+      });
+
+      const pollMsgId = key?.id;
+      if (!pollMsgId) {
+        continue;
+      }
+
+      const storedPoll = pollStore.getPoll(pollMsgId);
+      if (!storedPoll?.message) {
+        continue;
+      }
+
+      const pollCreationMsg = normalizeMessageContent(storedPoll.message.message ?? undefined);
+      const pollCreation =
+        pollCreationMsg?.pollCreationMessage ??
+        (pollCreationMsg as Record<string, unknown> | undefined)?.pollCreationMessageV2 ??
+        (pollCreationMsg as Record<string, unknown> | undefined)?.pollCreationMessageV3;
+      const options_list =
+        (pollCreation as { options?: Array<{ optionName?: string }> })?.options ?? [];
+      let messageSecret = (pollCreation as { messageSecret?: unknown })?.messageSecret;
+      if (typeof messageSecret === "string") {
+        messageSecret = Buffer.from(messageSecret, "base64");
+      }
+      if (!messageSecret) {
+        continue;
+      }
+
+      const pollQuestion = (pollCreation as { name?: string })?.name ?? "";
+      const pollCreatedAt = new Date(storedPoll.createdAt).toISOString();
+      const remoteJid = key.remoteJid ?? "";
+
+      for (const pollUpdate of update.pollUpdates as Array<{
+        pollUpdateMessageKey?: proto.IMessageKey;
+        vote?: proto.Message.IPollEncValue;
+      }>) {
+        const voterKey = pollUpdate.pollUpdateMessageKey;
+        const voterJid = voterKey?.participant || voterKey?.remoteJid || "";
+        if (!voterJid) {
+          continue;
+        }
+
+        // Deduplicate: skip voters already reported for this poll.
+        if (pollStore.isVoteReported(pollMsgId, voterJid)) {
+          continue;
+        }
+
+        const voterLabel = (await resolveInboundJid(voterJid)) || voterJid;
+        let voteBody = `<media:poll-vote voter="${voterLabel}" poll="${pollQuestion}" poll_id="${pollMsgId}" poll_created_at="${pollCreatedAt}">`;
+
+        if (pollUpdate.vote) {
+          let decrypted: ReturnType<typeof decryptPollVote> | null = null;
+          for (const creatorId of [self.lid, self.jid].filter(Boolean)) {
+            try {
+              decrypted = decryptPollVote(pollUpdate.vote, {
+                pollEncKey: messageSecret as Uint8Array,
+                pollCreatorJid: creatorId!,
+                pollMsgId,
+                voterJid,
+              });
+              if (decrypted?.selectedOptions?.length) {
+                break;
+              }
+            } catch {
+              // Try next identity variant.
+            }
+          }
+
+          if (decrypted?.selectedOptions?.length) {
+            const selected: string[] = [];
+            for (const optionHash of decrypted.selectedOptions) {
+              const voteHash = Buffer.isBuffer(optionHash)
+                ? optionHash.toString("hex")
+                : Buffer.from(optionHash).toString("hex");
+              for (const opt of options_list) {
+                const optName = opt.optionName ?? "";
+                const optHash = createHash("sha256").update(optName).digest("hex");
+                if (optHash === voteHash) {
+                  selected.push(optName);
+                  break;
+                }
+              }
+            }
+            if (selected.length > 0) {
+              const selectedStr = selected.join(", ");
+              voteBody = `<media:poll-vote voter="${voterLabel}" selected="${selectedStr}" poll="${pollQuestion}" poll_id="${pollMsgId}" poll_created_at="${pollCreatedAt}">`;
+            }
+          }
+        }
+
+        pollStore.markVoteReported(pollMsgId, voterJid);
+
+        // Construct a synthetic WAMessage and enqueue it through the standard pipeline.
+        const syntheticId = `poll-vote-${pollMsgId}-${voterJid}-${Date.now()}`;
+        const syntheticMsg: WAMessage = {
+          key: {
+            remoteJid,
+            fromMe: false,
+            id: syntheticId,
+            participant: voterJid,
+          },
+          messageTimestamp: Math.floor(Date.now() / 1000),
+          message: { conversation: voteBody },
+        };
+        const inbound = await normalizeInboundMessage(syntheticMsg);
+        if (!inbound) {
+          continue;
+        }
+        const enriched = { body: voteBody };
+        const dedupeKey = `${options.accountId}:${remoteJid}:${syntheticId}`;
+        if (!(await claimRecentInboundMessage(dedupeKey))) {
+          continue;
+        }
+        await enqueueInboundMessage(syntheticMsg, inbound, enriched);
+      }
+    }
+  };
+
+  // Handle emoji reactions as synthetic inbound messages.
+  const handleMessagesReaction = async (
+    reactions: Array<{ key: proto.IMessageKey; reaction: proto.IReaction }>,
+  ) => {
+    for (const { key, reaction } of reactions) {
+      if (!key.remoteJid) {
+        continue;
+      }
+      recordChannelActivity({
+        channel: "whatsapp",
+        accountId: options.accountId,
+        direction: "inbound",
+      });
+
+      const emoji = (reaction.text ?? "").trim();
+      const body = emoji ? `<reaction:${emoji}>` : "<reaction:removed>";
+      const reactorJid = reaction.key?.participant || reaction.key?.remoteJid || "";
+      const syntheticId = `reaction-${key.id}-${reactorJid}-${Date.now()}`;
+      const syntheticMsg: WAMessage = {
+        key: {
+          remoteJid: key.remoteJid,
+          fromMe: false,
+          id: syntheticId,
+          participant: reactorJid,
+        },
+        messageTimestamp: Math.floor(Date.now() / 1000),
+        message: { conversation: body },
+      };
+      const inbound = await normalizeInboundMessage(syntheticMsg);
+      if (!inbound) {
+        continue;
+      }
+      const enriched = { body };
+      const dedupeKey = `${options.accountId}:${key.remoteJid}:${syntheticId}`;
+      if (!(await claimRecentInboundMessage(dedupeKey))) {
+        continue;
+      }
+      await enqueueInboundMessage(syntheticMsg, inbound, enriched);
+    }
+  };
+
   const handleConnectionUpdate = (
     update: Partial<import("@whiskeysockets/baileys").ConnectionState>,
   ) => {
@@ -645,6 +917,24 @@ export async function attachWebInboxToSocket(
     "connection.update",
     handleConnectionUpdate as unknown as (...args: unknown[]) => void,
   );
+  const detachMessagesUpdate = attachEmitterListener(
+    sock.ev as unknown as {
+      on: (event: string, listener: (...args: unknown[]) => void) => void;
+      off?: (event: string, listener: (...args: unknown[]) => void) => void;
+      removeListener?: (event: string, listener: (...args: unknown[]) => void) => void;
+    },
+    "messages.update",
+    handleMessagesUpdate as unknown as (...args: unknown[]) => void,
+  );
+  const detachMessagesReaction = attachEmitterListener(
+    sock.ev as unknown as {
+      on: (event: string, listener: (...args: unknown[]) => void) => void;
+      off?: (event: string, listener: (...args: unknown[]) => void) => void;
+      removeListener?: (event: string, listener: (...args: unknown[]) => void) => void;
+    },
+    "messages.reaction",
+    handleMessagesReaction as unknown as (...args: unknown[]) => void,
+  );
 
   void (async () => {
     try {
@@ -674,11 +964,25 @@ export async function attachWebInboxToSocket(
     defaultAccountId: options.accountId,
   });
 
+  // Wrap sendPoll to track outbound polls in the PollStore for vote decryption.
+  const wrappedSendPoll: typeof sendApi.sendPoll = async (to, poll) => {
+    const result = await sendApi.sendPoll(to, poll);
+    if (result.rawResult && typeof result.rawResult === "object") {
+      const raw = result.rawResult as WAMessage;
+      if (raw.key?.id) {
+        pollStore.trackPoll(raw.key.id, raw);
+      }
+    }
+    return result;
+  };
+
   return {
     close: async () => {
       try {
         detachMessagesUpsert();
         detachConnectionUpdate();
+        detachMessagesUpdate();
+        detachMessagesReaction();
         closeInboundMonitorSocket(sock);
       } catch (err) {
         logVerbose(`Socket close failed: ${String(err)}`);
@@ -690,6 +994,7 @@ export async function attachWebInboxToSocket(
     },
     // IPC surface (sendMessage/sendPoll/sendReaction/sendComposingTo)
     ...sendApi,
+    sendPoll: wrappedSendPoll,
   } as const;
 }
 

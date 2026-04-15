@@ -75,7 +75,7 @@ export function createWebSendApi(params: {
     sendPoll: async (
       to: string,
       poll: { question: string; options: string[]; maxSelections?: number },
-    ): Promise<{ messageId: string }> => {
+    ): Promise<{ messageId: string; rawResult?: unknown }> => {
       const jid = toWhatsappJid(to);
       const result = await params.sock.sendMessage(jid, {
         poll: {
@@ -86,7 +86,7 @@ export function createWebSendApi(params: {
       } as AnyMessageContent);
       recordWhatsAppOutbound(params.defaultAccountId);
       const messageId = resolveOutboundMessageId(result);
-      return { messageId };
+      return { messageId, rawResult: result };
     },
     sendReaction: async (
       chatJid: string,

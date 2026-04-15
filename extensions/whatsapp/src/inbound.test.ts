@@ -193,6 +193,102 @@ describe("web inbound helpers", () => {
     ).toBe("<media:audio>");
   });
 
+  it("returns poll creation placeholder with question and options", () => {
+    expect(
+      extractMediaPlaceholder({
+        pollCreationMessage: {
+          name: "Mincha 2:30?",
+          options: [{ optionName: "yes" }, { optionName: "no" }, { optionName: "+1" }],
+        },
+      } as unknown as import("@whiskeysockets/baileys").proto.IMessage),
+    ).toBe("<media:poll>\nMincha 2:30?\n1. yes\n2. no\n3. +1");
+  });
+
+  it("returns poll creation V2 placeholder", () => {
+    expect(
+      extractMediaPlaceholder({
+        pollCreationMessageV2: {
+          name: "Lunch?",
+          options: [{ optionName: "Pizza" }, { optionName: "Sushi" }],
+        },
+      } as unknown as import("@whiskeysockets/baileys").proto.IMessage),
+    ).toBe("<media:poll>\nLunch?\n1. Pizza\n2. Sushi");
+  });
+
+  it("returns poll-vote placeholder for poll update messages", () => {
+    expect(
+      extractMediaPlaceholder({
+        pollUpdateMessage: {},
+      } as unknown as import("@whiskeysockets/baileys").proto.IMessage),
+    ).toBe("<media:poll-vote>");
+  });
+
+  it("returns reaction placeholder with emoji", () => {
+    expect(
+      extractMediaPlaceholder({
+        reactionMessage: { text: "\ud83d\ude02" },
+      } as unknown as import("@whiskeysockets/baileys").proto.IMessage),
+    ).toBe("<reaction:\ud83d\ude02>");
+  });
+
+  it("returns reaction:removed for empty reaction", () => {
+    expect(
+      extractMediaPlaceholder({
+        reactionMessage: { text: "" },
+      } as unknown as import("@whiskeysockets/baileys").proto.IMessage),
+    ).toBe("<reaction:removed>");
+  });
+
+  it("returns event placeholder with name and description", () => {
+    expect(
+      extractMediaPlaceholder({
+        eventMessage: { name: "Team Meeting", description: "Weekly sync", isCanceled: false },
+      } as unknown as import("@whiskeysockets/baileys").proto.IMessage),
+    ).toBe("<media:event>\nTeam Meeting\nWeekly sync");
+  });
+
+  it("returns event placeholder with CANCELED flag", () => {
+    expect(
+      extractMediaPlaceholder({
+        eventMessage: { name: "Team Meeting", isCanceled: true },
+      } as unknown as import("@whiskeysockets/baileys").proto.IMessage),
+    ).toBe("<media:event> [CANCELED]\nTeam Meeting");
+  });
+
+  it("returns event-rsvp placeholder for event responses", () => {
+    expect(
+      extractMediaPlaceholder({
+        eventResponseMessage: { response: 1 },
+      } as unknown as import("@whiskeysockets/baileys").proto.IMessage),
+    ).toBe("<event-rsvp:going>");
+    expect(
+      extractMediaPlaceholder({
+        eventResponseMessage: { response: 2 },
+      } as unknown as import("@whiskeysockets/baileys").proto.IMessage),
+    ).toBe("<event-rsvp:not-going>");
+    expect(
+      extractMediaPlaceholder({
+        eventResponseMessage: { response: 1, extraGuestCount: 3 },
+      } as unknown as import("@whiskeysockets/baileys").proto.IMessage),
+    ).toBe("<event-rsvp:going +3>");
+  });
+
+  it("returns encrypted-update placeholder for secret messages", () => {
+    expect(
+      extractMediaPlaceholder({
+        secretEncryptedMessage: {},
+      } as unknown as import("@whiskeysockets/baileys").proto.IMessage),
+    ).toBe("<media:encrypted-update>");
+  });
+
+  it("returns undefined for unrecognized message types", () => {
+    expect(
+      extractMediaPlaceholder({
+        someUnknownMessage: {},
+      } as unknown as import("@whiskeysockets/baileys").proto.IMessage),
+    ).toBeUndefined();
+  });
+
   it("extracts WhatsApp location messages", () => {
     const location = extractLocationData({
       locationMessage: {
